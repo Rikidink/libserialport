@@ -73,20 +73,6 @@ SP_API enum sp_return sp_get_port_by_name(const char *portname, struct sp_port *
 
 	DEBUG_FMT("Building structure for port %s", portname);
 
-#if !defined(_WIN32) && defined(HAVE_REALPATH)
-	/*
-	 * get_port_details() below tries to be too smart and figure out
-	 * some transport properties from the port name which breaks with
-	 * symlinks. Therefore we canonicalize the portname first.
-	 */
-	char pathbuf[PATH_MAX + 1];
-	char *res = realpath(portname, pathbuf);
-	if (!res)
-		RETURN_ERROR(SP_ERR_ARG, "Could not retrieve realpath behind port name");
-
-	portname = pathbuf;
-#endif
-
 	if (!(port = malloc(sizeof(struct sp_port))))
 		RETURN_ERROR(SP_ERR_MEM, "Port structure malloc failed");
 
@@ -427,28 +413,9 @@ static enum sp_return restart_wait(struct sp_port *port)
 		if (GetOverlappedResult(port->hdl, &port->wait_ovl,
 				&wait_result, FALSE)) {
 			DEBUG("Previous wait completed");
-			port->last_wait_thread_exited = FALSE;
-			port->wait_running = FALSE;
-		} else if (GetLastError() == ERROR_OPERATION_ABORTED) {
-			/* This error is returned if the last thread that called
-			 * restart_wait() has exited while WaitCommEvent() was
-			 * still active. In that case we don't consider that to
-			 * be an error. Just restart the wait procedure instead.
-			 */
-			DEBUG("Previous wait ended due to previous thread exiting");
-			/* We need to record that the wait thread exited before
-			 * we called WaitCommEvent(). This is because the exit of
-			 * the previous thread always generates a spurious wakeup,
-			 * and if no data has been received in the mean time, the
-			 * WaitCommEvent() wouldn't be restarted a second time by
-			 * restart_wait_if_needed() after a read call after the
-			 * spurious wakeup.
-			 */
-			port->last_wait_thread_exited = TRUE;
 			port->wait_running = FALSE;
 		} else if (GetLastError() == ERROR_IO_INCOMPLETE) {
 			DEBUG("Previous wait still running");
-			port->last_wait_thread_exited = FALSE;
 			RETURN_OK();
 		} else {
 			RETURN_FAIL("GetOverlappedResult() failed");
@@ -609,15 +576,6 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 		RETURN_CODEVAL(ret);
 	}
 
-	/*
-	 * Assume a default baudrate if the OS does not provide one.
-	 * Cannot assign -1 here since Windows holds the baudrate in
-	 * the DCB and does not configure the rate individually.
-	 */
-	if (config.baudrate == 0) {
-		config.baudrate = 9600;
-	}
-
 	/* Set sane port settings. */
 #ifdef _WIN32
 	data.dcb.fBinary = TRUE;
@@ -709,10 +667,6 @@ SP_API enum sp_return sp_close(struct sp_port *port)
 		port->write_buf = NULL;
 	}
 #else
-#ifdef TIOCNXCL
-	ioctl(port->fd, TIOCNXCL);
-#endif
-
 	/* Returns 0 upon success, -1 upon failure. */
 	if (close(port->fd) == -1)
 		RETURN_FAIL("close() failed");
@@ -909,7 +863,7 @@ SP_API enum sp_return sp_blocking_write(struct sp_port *port, const void *buf,
 	unsigned char *ptr = (unsigned char *) buf;
 	struct timeout timeout;
 	fd_set fds;
-	ssize_t result;
+	int result;
 
 	timeout_start(&timeout, timeout_ms);
 
@@ -1045,11 +999,7 @@ static enum sp_return restart_wait_if_needed(struct sp_port *port, unsigned int 
 	DWORD errors;
 	COMSTAT comstat;
 
-	/* Only skip restarting the wait operation if we didn't have a
-	 * wakeup immediately following the exit of the last thread that
-	 * re-initiated the wait loop.
-	 */
-	if (!port->last_wait_thread_exited && bytes_read == 0)
+	if (bytes_read == 0)
 		RETURN_OK();
 
 	if (ClearCommError(port->hdl, &errors, &comstat) == 0)
@@ -1118,7 +1068,7 @@ SP_API enum sp_return sp_blocking_read(struct sp_port *port, void *buf,
 	unsigned char *ptr = (unsigned char *) buf;
 	struct timeout timeout;
 	fd_set fds;
-	ssize_t result;
+	int result;
 
 	timeout_start(&timeout, timeout_ms);
 
@@ -1241,7 +1191,7 @@ SP_API enum sp_return sp_blocking_read_next(struct sp_port *port, void *buf,
 	size_t bytes_read = 0;
 	struct timeout timeout;
 	fd_set fds;
-	ssize_t result;
+	int result;
 
 	timeout_start(&timeout, timeout_ms);
 
@@ -2317,7 +2267,6 @@ SP_API enum sp_return sp_new_config(struct sp_port_config **config_ptr)
 	config->cts = -1;
 	config->dtr = -1;
 	config->dsr = -1;
-	config->xon_xoff = -1;
 
 	*config_ptr = config;
 
